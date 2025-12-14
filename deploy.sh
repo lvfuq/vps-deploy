@@ -1,176 +1,397 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-log(){ echo "[deploy] $*"; }
-die(){ echo "[deploy][ERROR] $*" >&2; exit 1; }
+SB_DIR="/opt/sing-box"
+BIN="/usr/local/bin/sing-box"
+CONF_JSON="${SB_DIR}/config.json"
+DATA_DIR="${SB_DIR}/data"
+CREDS_ENV="${SB_DIR}/creds.env"
+SUB_ENV="${SB_DIR}/sub_urls.env"
+SERVICE="sing-box.service"
 
-require_root() {
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行（或 sudo -i 后再执行）"
+SS_METHOD="aes-256-gcm"
+REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"   # 你想改也行：export REALITY_SNI=xxx
+
+log(){ echo "[deploy] $*"; }
+warn(){ echo "[deploy][WARN] $*"; }
+die(){ echo "[deploy][ERROR] $*" >&2; exit 1; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+
+require_root(){
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行（sudo -i 后再执行）"
 }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1; }
-
-apt_install() {
+apt_install(){
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y >/dev/null 2>&1 || true
   apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 || true
 }
 
-ensure_base_deps() {
-  if ! need_cmd apt-get; then die "当前脚本仅按 Debian/Ubuntu 的 apt-get 写（你说你是 Debian）"; fi
-  apt_install ca-certificates curl wget jq openssl iproute2 coreutils python3
-  need_cmd curl || die "curl 未安装"
-  need_cmd jq   || die "jq 未安装"
+ensure_deps(){
+  has apt-get || die "当前脚本按 Debian/Ubuntu 编写（需要 apt-get）"
+  apt_install ca-certificates curl jq openssl tar unzip iproute2 iptables uuid-runtime netfilter-persistent
+  has curl || die "curl 未安装"
+  has jq   || die "jq 未安装"
+  has openssl || die "openssl 未安装"
 }
 
-enable_bbr_and_tune() {
-  log "开启 BBR + 保守 TCP 优化（不换内核、不要求重启）..."
-  modprobe tcp_bbr >/dev/null 2>&1 || true
-  cat >/etc/sysctl.d/99-vps-tune.conf <<'EOF'
+b64_nw(){
+  if base64 --help 2>/dev/null | grep -q -- "-w"; then base64 -w 0; else base64 | tr -d '\n'; fi
+}
+b64url_nopad(){ tr '+/' '-_' | tr -d '='; }
+
+rand_port(){
+  local p
+  while :; do
+    p=$((20000 + ( ( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') ) % 40000 )))
+    ss -lntup 2>/dev/null | grep -q ":$p " || { echo "$p"; return; }
+  done
+}
+
+get_ip(){
+  local ip=""
+  ip="$(curl -4fsS https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -4fsS https://ip.sb 2>/dev/null || true)"
+  [[ -z "$ip" ]] && ip="$(curl -4fsS ipv4.icanhazip.com 2>/dev/null || true)"
+  echo "${ip:-127.0.0.1}"
+}
+
+install_singbox(){
+  if [[ -x "$BIN" ]]; then
+    log "检测到 sing-box：$("$BIN" version | head -n1)"
+    return 0
+  fi
+
+  log "下载 sing-box（amd64/arm64 自动识别）..."
+  local arch api re url tmp pkg
+
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) die "不支持的架构：$(uname -m)" ;;
+  esac
+
+  api="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  re="^sing-box-.*-linux-${arch}\\.(tar\\.(gz|xz)|zip)$"
+  url="$(curl -fsSL "$api" | jq -r --arg re "$re" '.assets[] | select(.name|test($re)) | .browser_download_url' | head -n1)"
+  [[ -n "$url" && "$url" != "null" ]] || die "获取 sing-box 下载地址失败"
+
+  tmp="$(mktemp -d)"
+  pkg="$tmp/pkg"
+  curl -fL "$url" -o "$pkg" >/dev/null
+
+  if echo "$url" | grep -qE '\.tar\.gz$|\.tgz$'; then
+    tar -xzf "$pkg" -C "$tmp"
+  elif echo "$url" | grep -qE '\.tar\.xz$'; then
+    tar -xJf "$pkg" -C "$tmp"
+  elif echo "$url" | grep -qE '\.zip$'; then
+    unzip -q "$pkg" -d "$tmp"
+  else
+    rm -rf "$tmp"; die "未知包格式：$url"
+  fi
+
+  local sb
+  sb="$(find "$tmp" -type f -name sing-box | head -n1)"
+  [[ -n "$sb" ]] || { rm -rf "$tmp"; die "包内未找到 sing-box 可执行文件"; }
+
+  install -m 0755 "$sb" "$BIN"
+  rm -rf "$tmp"
+  log "安装完成：$("$BIN" version | head -n1)"
+}
+
+enable_bbr(){
+  mkdir -p /etc/sysctl.d
+  cat >/etc/sysctl.d/99-bbr.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-
-# 保守优化（一般不会“越调越慢”）
-net.core.somaxconn=8192
-net.core.netdev_max_backlog=16384
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_fastopen=3
-net.ipv4.tcp_mtu_probing=1
 EOF
   sysctl --system >/dev/null 2>&1 || true
-
-  log "当前拥塞算法：$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-  log "当前队列算法：$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  if sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q bbr; then
+    log "BBR 已启用"
+  else
+    warn "BBR 未启用（可能内核不支持）；不影响节点可用性"
+  fi
 }
 
-run_singbox_plus_install() {
-  local sbp_url="https://raw.githubusercontent.com/Alvin9999/Sing-Box-Plus/main/sing-box-plus.sh"
-  local sbp_path="/root/sing-box-plus.sh"
-
-  log "下载 Sing-Box-Plus ..."
-  curl -fsSL "$sbp_url" -o "$sbp_path" || die "下载 Sing-Box-Plus 失败"
-  chmod +x "$sbp_path"
-
-  log "执行 Sing-Box-Plus（默认选 1：安装/部署）..."
-  # 说明：这一步就是你手工运行脚本后输入 1 的等价操作
-  # 在 SSH 终端里执行没问题
-  printf "1\n" | bash "$sbp_path" >/tmp/sbp_install.log 2>&1 || {
-    echo "---- /tmp/sbp_install.log 最后 120 行 ----" >&2
-    tail -n 120 /tmp/sbp_install.log >&2 || true
-    die "Sing-Box-Plus 安装/部署失败"
-  }
+rand_hex8(){
+  openssl rand -hex 8 | tr -d '\n'
 }
 
-collect_links_from_sbp() {
-  local sbp_path="/root/sing-box-plus.sh"
-  [[ -f "$sbp_path" ]] || die "未找到 $sbp_path（上一步应该已下载）"
-
-  log "提取 18 个节点链接（默认选 2：查看分享链接）..."
-  local out clean links
-  out="$(printf "2\n" | bash "$sbp_path" 2>/dev/null || true)"
-
-  # 去 ANSI 颜色码
-  clean="$(printf "%s" "$out" | sed -r 's/\x1B\[[0-9;]*[A-Za-z]//g')"
-
-  # 抽取链接行
-  links="$(printf "%s\n" "$clean" | sed -nE 's/^[[:space:]]+//; /^[[:space:]]*(vless|trojan|hy2|vmess|ss|tuic):\/\//p')"
-
-  # 基本校验
-  local n
-  n="$(printf "%s\n" "$links" | sed '/^$/d' | wc -l | tr -d ' ')"
-  [[ "$n" -ge 9 ]] || {
-    echo "---- 解析失败时的输出片段（最后 120 行） ----" >&2
-    printf "%s\n" "$clean" | tail -n 120 >&2 || true
-    die "未能从 Sing-Box-Plus 输出中解析到足够的节点链接（仅 $n 条）"
-  }
-
-  # 输出到文件（纯链接，每行一条）
-  printf "%s\n" "$links" | sed '/^$/d' > /root/nodes.txt
-
-  log "已写入 /root/nodes.txt（$(wc -l </root/nodes.txt | tr -d ' ') 条）"
+gen_uuid(){
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi
 }
 
-update_gist_subscription() {
-  # 你要的“固定订阅链接”：用同一个 GIST_ID，每次更新同一个文件内容
-  : "${GIST_ID:=}"
-  : "${GH_TOKEN:=}"
+gen_reality_keypair(){
+  "$BIN" generate reality-keypair
+}
 
-  [[ -n "$GIST_ID" ]] || die "缺少环境变量 GIST_ID"
-  [[ -n "$GH_TOKEN" ]] || die "缺少环境变量 GH_TOKEN"
+save_creds(){
+  cat >"$CREDS_ENV" <<EOF
+UUID=$UUID
+SS_PORT=$SS_PORT
+SS_PASSWORD=$(printf '%q' "$SS_PASSWORD")
+VLESS_PORT=$VLESS_PORT
+TROJAN_PORT=$TROJAN_PORT
+REALITY_PRIV=$(printf '%q' "$REALITY_PRIV")
+REALITY_PUB=$(printf '%q' "$REALITY_PUB")
+REALITY_SID=$REALITY_SID
+REALITY_SNI=$REALITY_SNI
+EOF
+}
 
-  [[ -s /root/nodes.txt ]] || die "/root/nodes.txt 不存在或为空"
+load_creds_if_any(){
+  [[ -f "$CREDS_ENV" ]] || return 0
+  # shellcheck disable=SC1090
+  source "$CREDS_ENV" || true
+}
 
-  # 订阅一般用 base64（一行）
-  local b64
-  b64="$(base64 -w0 /root/nodes.txt)"
+write_config(){
+  mkdir -p "$SB_DIR" "$DATA_DIR"
+  load_creds_if_any
 
-  log "更新 GitHub Gist：$GIST_ID ..."
-  local api="https://api.github.com/gists/${GIST_ID}"
-  local payload
-  payload="$(jq -n --arg c "$b64" '{files: {"sub.txt": {content: $c}}}')"
+  : "${UUID:=$(gen_uuid)}"
+  : "${SS_PORT:=$(rand_port)}"
+  : "${VLESS_PORT:=$(rand_port)}"
+  : "${TROJAN_PORT:=$(rand_port)}"
+  : "${SS_PASSWORD:=$(openssl rand -base64 24 | tr -d '\n')}"
 
-  # PATCH 更新
-  local http_code
-  http_code="$(
-    curl -sS -o /tmp/gist_update.json -w "%{http_code}" \
-      -X PATCH "$api" \
-      -H "Authorization: token ${GH_TOKEN}" \
-      -H "Accept: application/vnd.github+json" \
-      -d "$payload" || echo 000
-  )"
+  if [[ -z "${REALITY_PRIV:-}" || -z "${REALITY_PUB:-}" ]]; then
+    mapfile -t RKP < <(gen_reality_keypair)
+    REALITY_PRIV="$(printf "%s\n" "${RKP[@]}" | awk '/PrivateKey/{print $2}')"
+    REALITY_PUB="$(printf "%s\n" "${RKP[@]}" | awk '/PublicKey/{print $2}')"
+  fi
+  : "${REALITY_SID:=$(rand_hex8)}"
 
-  if [[ "$http_code" != "200" ]]; then
-    echo "---- /tmp/gist_update.json ----" >&2
-    cat /tmp/gist_update.json >&2 || true
-    die "更新 Gist 失败（HTTP $http_code）。常见原因：Token 没有 Gist 写权限 / GIST_ID 写错 / Token 已过期"
+  save_creds
+
+  jq -n \
+    --arg uuid "$UUID" \
+    --arg ss_method "$SS_METHOD" \
+    --arg ss_pass "$SS_PASSWORD" \
+    --arg sni "$REALITY_SNI" \
+    --arg rpriv "$REALITY_PRIV" \
+    --arg sid "$REALITY_SID" \
+    --argjson ss_port "$SS_PORT" \
+    --argjson vless_port "$VLESS_PORT" \
+    --argjson trojan_port "$TROJAN_PORT" \
+    '{
+      log:{level:"info",timestamp:true},
+      inbounds:[
+        {
+          type:"shadowsocks",
+          tag:"ss-in",
+          listen:"0.0.0.0",
+          listen_port:$ss_port,
+          method:$ss_method,
+          password:$ss_pass
+        },
+        {
+          type:"vless",
+          tag:"vless-reality",
+          listen:"0.0.0.0",
+          listen_port:$vless_port,
+          users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
+          tls:{
+            enabled:true,
+            server_name:$sni,
+            reality:{
+              enabled:true,
+              handshake:{server:$sni, server_port:443},
+              private_key:$rpriv,
+              short_id:[$sid]
+            }
+          }
+        },
+        {
+          type:"trojan",
+          tag:"trojan-reality",
+          listen:"0.0.0.0",
+          listen_port:$trojan_port,
+          users:[{password:$uuid}],
+          tls:{
+            enabled:true,
+            server_name:$sni,
+            reality:{
+              enabled:true,
+              handshake:{server:$sni, server_port:443},
+              private_key:$rpriv,
+              short_id:[$sid]
+            }
+          }
+        }
+      ],
+      outbounds:[{type:"direct",tag:"direct"}],
+      route:{final:"direct"}
+    }' >"$CONF_JSON"
+
+  "$BIN" check -c "$CONF_JSON" >/dev/null
+  log "配置已写入：$CONF_JSON"
+}
+
+write_systemd(){
+  cat >/etc/systemd/system/$SERVICE <<EOF
+[Unit]
+Description=sing-box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$BIN run -c $CONF_JSON -D $DATA_DIR
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+  systemctl is-active --quiet "$SERVICE" || die "服务未启动成功：systemctl status $SERVICE"
+  log "服务状态：active"
+}
+
+open_firewall(){
+  load_creds_if_any
+  local tcp_ports=("$SS_PORT" "$VLESS_PORT" "$TROJAN_PORT")
+
+  if has ufw && ufw status | grep -qi active; then
+    for p in "${tcp_ports[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
+    ufw reload >/dev/null 2>&1 || true
+    log "已通过 ufw 放行 TCP 端口：${tcp_ports[*]}"
+    return 0
   fi
 
-  # 取 raw_url（稳定订阅链接）
-  local raw_url
-  raw_url="$(jq -r '.files["sub.txt"].raw_url // empty' /tmp/gist_update.json)"
-  [[ -n "$raw_url" ]] || {
-    # 兜底：再 GET 一次
-    raw_url="$(
-      curl -fsSL \
-        -H "Authorization: token ${GH_TOKEN}" \
-        -H "Accept: application/vnd.github+json" \
-        "$api" | jq -r '.files["sub.txt"].raw_url // empty'
-    )"
-  }
-  [[ -n "$raw_url" ]] || die "未能获取 Gist 的 raw_url（请打开 Gist 确认存在 sub.txt）"
-
-  log "订阅链接（Gist Raw）：$raw_url"
-  printf "%s\n" "$raw_url" > /root/subscription_url.txt
-}
-
-print_summary() {
-  echo
-  echo "==================== 结果 ===================="
-  echo "Sing-Box 服务：$(systemctl is-active sing-box.service 2>/dev/null || echo unknown)"
-  echo
-  echo "==== 监听端口（sing-box）===="
-  ss -lntup 2>/dev/null | grep -F 'sing-box' || true
-  echo
-  if [[ -s /root/subscription_url.txt ]]; then
-    echo "==== 订阅链接（请自己保存，不要公开）===="
-    cat /root/subscription_url.txt
-    echo
+  if has firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    for p in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true; done
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    log "已通过 firewalld 放行 TCP 端口：${tcp_ports[*]}"
+    return 0
   fi
-  echo "==== 节点链接（每行一条）===="
-  cat /root/nodes.txt
-  echo "=============================================="
-  echo
-  echo "提示：如果你在 Vultr/云平台开启了“云防火墙/安全组”，仍需要在面板放行这些端口（系统内 iptables 放行不影响云防火墙）。"
+
+  for p in "${tcp_ports[@]}"; do
+    iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+  done
+  if has netfilter-persistent; then netfilter-persistent save >/dev/null 2>&1 || true; fi
+  log "已通过 iptables 放行 TCP 端口：${tcp_ports[*]}"
+  warn "如果你用的是云厂商安全组（Vultr/Oracle 等），还要在控制台放行这些端口"
 }
 
-main() {
+make_links(){
+  load_creds_if_any
+  local ip; ip="$(get_ip)"
+
+  # SS: ss://base64url(method:pass)@ip:port#ss
+  local userinfo ss_link vless_link trojan_link
+  userinfo="$(printf "%s:%s" "$SS_METHOD" "$SS_PASSWORD" | b64_nw | b64url_nopad)"
+  ss_link="ss://${userinfo}@${ip}:${SS_PORT}#ss"
+
+  vless_link="vless://${UUID}@${ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality"
+  trojan_link="trojan://${UUID}@${ip}:${TROJAN_PORT}?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality"
+
+  echo "$ss_link"
+  echo "$vless_link"
+  echo "$trojan_link"
+}
+
+self_test_ss_loopback(){
+  # 只做 SS 闭环自测（最可靠）
+  load_creds_if_any
+  local test_cfg="/tmp/sb-test.json"
+  local socks_port="10808"
+
+  cat >"$test_cfg" <<EOF
+{
+  "log":{"level":"error"},
+  "inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":${socks_port}}],
+  "outbounds":[
+    {"type":"shadowsocks","tag":"ss","server":"127.0.0.1","server_port":${SS_PORT},"method":"${SS_METHOD}","password":"${SS_PASSWORD}"},
+    {"type":"direct","tag":"direct"}
+  ],
+  "route":{"final":"ss"}
+}
+EOF
+
+  "$BIN" check -c "$test_cfg" >/dev/null 2>&1 || { warn "自测配置检查失败"; return 0; }
+
+  "$BIN" run -c "$test_cfg" >/tmp/sb-test.log 2>&1 &
+  local pid=$!
+  sleep 0.8
+
+  if curl -fsS --socks5-hostname "127.0.0.1:${socks_port}" https://www.cloudflare.com/cdn-cgi/trace >/dev/null 2>&1; then
+    log "自测通过：SS 工作正常（本机回环 OK）"
+  else
+    warn "自测失败：请看 /tmp/sb-test.log 以及 systemctl status ${SERVICE}"
+  fi
+
+  kill "$pid" >/dev/null 2>&1 || true
+  rm -f "$test_cfg" >/dev/null 2>&1 || true
+}
+
+update_gist_subscription_if_needed(){
+  [[ -n "${GIST_ID:-}" && -n "${GH_TOKEN:-}" ]] || return 0
+
+  local links plain sub_b64 payload resp code raw_b64 raw_plain
+  links="$(make_links)"
+  plain="${links}"$'\n'
+  sub_b64="$(printf "%s" "$plain" | b64_nw)"
+
+  payload="$(jq -n \
+    --arg sub_b64 "$sub_b64" \
+    --arg plain "$plain" \
+    '{
+      files:{
+        "sub.txt":{content:$sub_b64},
+        "sub_plain.txt":{content:$plain}
+      }
+    }')"
+
+  resp="$(mktemp)"
+  code="$(curl -sS -o "$resp" -w "%{http_code}" \
+    -X PATCH \
+    -H "Authorization: Bearer '"$GH_TOKEN"'" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/gists/${GIST_ID}" \
+    -d "$payload" || true)"
+
+  if [[ "$code" != "200" ]]; then
+    warn "Gist 更新失败（HTTP $code）。通常是 token 没有 gist 权限 / GIST_ID 写错 / token 失效"
+    rm -f "$resp"
+    return 0
+  fi
+
+  raw_b64="$(jq -r '.files["sub.txt"].raw_url' <"$resp")"
+  raw_plain="$(jq -r '.files["sub_plain.txt"].raw_url' <"$resp")"
+  rm -f "$resp"
+
+  mkdir -p "$SB_DIR"
+  cat >"$SUB_ENV" <<EOF
+SUB_B64_URL=$raw_b64
+SUB_PLAIN_URL=$raw_plain
+EOF
+
+  log "订阅已更新到你的 Gist（链接已写入 $SUB_ENV，不在终端打印）"
+}
+
+main(){
   require_root
-  ensure_base_deps
-  enable_bbr_and_tune
-  run_singbox_plus_install
-  collect_links_from_sbp
-  update_gist_subscription
-  print_summary
+  ensure_deps
+  enable_bbr
+  install_singbox
+  write_config
+  write_systemd
+  open_firewall
+
+  echo
+  echo "==== 节点链接（我帮你选的“好用三件套”）===="
+  make_links
+  echo
+
+  self_test_ss_loopback
+  update_gist_subscription_if_needed || true
+
+  log "完成"
 }
 
 main "$@"
