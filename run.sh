@@ -1,148 +1,111 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
-# ===== Repo deploy.sh raw URL (no ?token=...) =====
-DEPLOY_URL="https://raw.githubusercontent.com/lvfuq/vps-deploy/main/deploy.sh"
+DEPLOY_URL="${DEPLOY_URL:-https://raw.githubusercontent.com/lvfuq/vps-deploy/main/deploy.sh}"
 
-# ===== Files =====
-RUN_LOG="/root/run.log"
-SUB_TXT="/root/sub.txt"
-SUB_B64="/root/sub.b64"
-SHARE_LINKS="/root/share_links.txt"
-CFG="/etc/sing-box/config.json"
+SB_DIR="/opt/sing-box"
+PORTS_ENV="${SB_DIR}/ports.env"
+CREDS_ENV="${SB_DIR}/creds.env"
+WARP_ENV="${SB_DIR}/warp.env"
 
-ok(){  printf "PASS  %s\n" "$*"; }
-bad(){ printf "FAIL  %s\n" "$*"; }
-info(){ printf "INFO  %s\n" "$*"; }
+REALITY_SERVER="${REALITY_SERVER:-www.microsoft.com}"
+GRPC_SERVICE="${GRPC_SERVICE:-grpc}"
+VMESS_WS_PATH="${VMESS_WS_PATH:-/vm}"
 
-is_listen_tcp(){ ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${1}$"; }
-is_listen_udp(){ ss -lnu 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${1}$"; }
+need_root(){ [ "${EUID:-0}" -eq 0 ] || { echo "ERROR: 请用 root 执行"; exit 1; }; }
 
-# ----- root -----
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "ERROR: 请用 root 执行（sudo -i）" >&2
+b64enc(){ base64 -w0 2>/dev/null || base64; }
+
+urlenc(){ python3 - <<'PY' "$1"
+import sys,urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+}
+
+get_ip(){
+  local ip
+  ip="$(curl -fsSL https://api.ipify.org || true)"
+  [ -n "${ip}" ] || ip="$(curl -fsSL ipv4.icanhazip.com || true)"
+  echo "${ip:-127.0.0.1}"
+}
+
+# ====== 执行部署 ======
+need_root
+if [ -z "${GIST_ID:-}" ] || [ -z "${GH_TOKEN:-}" ]; then
+  echo "ERROR: 需要在同一行命令里提供 GIST_ID 和 GH_TOKEN（仅 gist 权限）"
+  echo '示例：GIST_ID=xxxx GH_TOKEN=yyyy bash <(curl -fsSL https://raw.githubusercontent.com/lvfuq/vps-deploy/main/run.sh)'
   exit 1
 fi
 
-# ----- deps (Debian) -----
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null 2>&1 || true
-apt-get install -y curl ca-certificates jq python3 iproute2 coreutils >/dev/null 2>&1 || true
+tmp="$(mktemp -d)"
+curl -fsSL "${DEPLOY_URL}" -o "${tmp}/deploy.sh"
+chmod +x "${tmp}/deploy.sh"
+bash "${tmp}/deploy.sh"
+rm -rf "${tmp}"
 
-# ----- download deploy.sh (cache-bust) -----
-tmpdir="$(mktemp -d)"
-trap 'rm -rf "$tmpdir"' EXIT
+# ====== 读取落盘参数 ======
+set +u
+source "${CREDS_ENV}"
+source "${PORTS_ENV}"
+[ -f "${WARP_ENV}" ] && source "${WARP_ENV}" || true
+set -u
 
-curl -fsSL "${DEPLOY_URL}?ts=$(date +%s)" -o "$tmpdir/deploy.sh"
-chmod +x "$tmpdir/deploy.sh"
+ip="$(get_ip)"
 
-# ----- auto-fix known bad urlencode/b64url_nopad blocks -----
-# If deploy.sh contains "urllib.parse.quote", it is the buggy version; patch it in-place before bash parses it.
-if grep -q "urllib.parse.quote" "$tmpdir/deploy.sh"; then
-  python3 - "$tmpdir/deploy.sh" <<'PY'
-import re, sys, pathlib
+# ====== 生成链接（18 个）=====
+VMESS_JSON=$(cat <<JSON
+{"v":"2","ps":"vmess-ws","add":"${ip}","port":"${PORT_VMESS_WS}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
+JSON
+)
+VMESS_JSON_W=$(cat <<JSON
+{"v":"2","ps":"vmess-ws-warp","add":"${ip}","port":"${PORT_VMESS_WS_W}","id":"${UUID}","aid":"0","net":"ws","type":"none","host":"","path":"${VMESS_WS_PATH}","tls":""}
+JSON
+)
 
-p = pathlib.Path(sys.argv[1])
-lines = p.read_text(errors="ignore").splitlines(True)
+links=()
+links+=("vless://${UUID}@${ip}:${PORT_VLESSR}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality")
+links+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality")
+links+=("trojan://${UUID}@${ip}:${PORT_TROJANR}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality")
+links+=("hy2://$(urlenc "${HY2_PWD}")@${ip}:${PORT_HY2}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#hysteria2")
+links+=("vmess://$(printf "%s" "${VMESS_JSON}" | b64enc)")
+links+=("hy2://$(urlenc "${HY2_PWD2}")@${ip}:${PORT_HY2_OBFS}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs")
+links+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022}#ss2022")
+links+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS}#ss")
+links+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5")
 
-def replace_func(lines, func_name, replacement):
-  out = []
-  i = 0
-  replaced = False
-  start_re = re.compile(r'^\s*' + re.escape(func_name) + r'\(\)\s*\{')
-  end_re = re.compile(r'^\s*\}\s*$')
-  while i < len(lines):
-    if start_re.match(lines[i]):
-      # skip until closing brace line
-      i += 1
-      while i < len(lines) and not end_re.match(lines[i]):
-        i += 1
-      if i < len(lines) and end_re.match(lines[i]):
-        i += 1  # skip the closing brace
-      out.append(replacement + "\n")
-      replaced = True
-      continue
-    out.append(lines[i])
-    i += 1
-  return out, replaced
+links+=("vless://${UUID}@${ip}:${PORT_VLESSR_W}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-warp")
+links+=("vless://${UUID}@${ip}:${PORT_VLESS_GRPCR_W}?encryption=none&security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=grpc&serviceName=${GRPC_SERVICE}#vless-grpc-reality-warp")
+links+=("trojan://${UUID}@${ip}:${PORT_TROJANR_W}?security=reality&sni=${REALITY_SERVER}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality-warp")
+links+=("hy2://$(urlenc "${HY2_PWD}")@${ip}:${PORT_HY2_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#hysteria2-warp")
+links+=("vmess://$(printf "%s" "${VMESS_JSON_W}" | b64enc)")
+links+=("hy2://$(urlenc "${HY2_PWD2}")@${ip}:${PORT_HY2_OBFS_W}?insecure=1&allowInsecure=1&sni=${REALITY_SERVER}&alpn=h3&obfs=salamander&obfs-password=$(urlenc "${HY2_OBFS_PWD}")#hysteria2-obfs-warp")
+links+=("ss://$(printf "%s" "2022-blake3-aes-256-gcm:${SS2022_KEY}" | b64enc)@${ip}:${PORT_SS2022_W}#ss2022-warp")
+links+=("ss://$(printf "%s" "aes-256-gcm:${SS_PWD}" | b64enc)@${ip}:${PORT_SS_W}#ss-warp")
+links+=("tuic://${UUID}:$(urlenc "${UUID}")@${ip}:${PORT_TUIC_W}?congestion_control=bbr&alpn=h3&insecure=1&allowInsecure=1&sni=${REALITY_SERVER}#tuic-v5-warp")
 
-url_rep = "urlencode() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.stdin.read().strip(), safe=\"\"))'; }"
-b64_rep = "b64url_nopad() { python3 -c 'import base64,sys;print(base64.urlsafe_b64encode(sys.stdin.buffer.read()).decode().rstrip(\"=\"))'; }"
+# ====== 自检：服务 + 端口监听 ======
+echo "==== sing-box 状态 ===="
+systemctl is-active sing-box.service || true
+echo
 
-lines, r1 = replace_func(lines, "urlencode", url_rep)
-lines, r2 = replace_func(lines, "b64url_nopad", b64_rep)
+echo "==== 监听端口（只看 sing-box）===="
+ss -lntup | grep sing-box || true
+ss -lnu  | grep sing-box || true
+echo
 
-# If functions weren't found (rare), inject near top after shebang
-if not (r1 and r2):
-  new_lines = []
-  inserted = False
-  for idx, ln in enumerate(lines):
-    new_lines.append(ln)
-    if (not inserted) and ln.startswith("#!") :
-      # insert after shebang
-      new_lines.append(url_rep + "\n")
-      new_lines.append(b64_rep + "\n")
-      inserted = True
-  lines = new_lines
+echo "==== 节点链接（18 个）===="
+for l in "${links[@]}"; do
+  echo "${l}"
+done
+echo
 
-p.write_text("".join(lines))
-PY
-fi
+# ====== 更新 Gist 订阅（不打印订阅 URL）=====
+sub_content="$(printf "%s\n" "${links[@]}")"
+payload="$(jq -n --arg c "$sub_content" '{files: {"sub.txt": {content:$c}}}')"
+curl -fsSL -X PATCH \
+  -H "Authorization: token '"${GH_TOKEN}"'" \
+  -H "Accept: application/vnd.github+json" \
+  -d "$payload" \
+  "https://api.github.com/gists/${GIST_ID}" >/dev/null
 
-# ----- run deploy.sh (capture all output; do not print subscription link) -----
-: >"$RUN_LOG" || true
-(
-  : "${GIST_ID:=}"
-  : "${GH_TOKEN:=}"
-  export GIST_ID GH_TOKEN
-  bash "$tmpdir/deploy.sh"
-) >"$RUN_LOG" 2>&1 || {
-  echo "ERROR: deploy.sh failed. Last 120 lines:" >&2
-  tail -n 120 "$RUN_LOG" >&2 || true
-  exit 2
-}
-
-# ----- self-test -----
-echo "========== SELF-TEST =========="
-
-if systemctl is-active --quiet sing-box; then
-  ok "sing-box service is running"
-else
-  bad "sing-box service NOT running"
-  info "journalctl -u sing-box -n 120 --no-pager"
-fi
-
-if [[ -f "$CFG" ]]; then
-  ok "found $CFG"
-  mapfile -t inbounds < <(jq -r '.inbounds[] | "\(.type) \(.listen_port)"' "$CFG" 2>/dev/null || true)
-  if [[ "${#inbounds[@]}" -gt 0 ]]; then
-    for item in "${inbounds[@]}"; do
-      t="$(awk '{print $1}' <<<"$item")"
-      p="$(awk '{print $2}' <<<"$item")"
-      [[ -z "$p" ]] && continue
-      case "$t" in
-        hysteria2|tuic)
-          is_listen_udp "$p" && ok "UDP listening ${p} (${t})" || bad "UDP NOT listening ${p} (${t})"
-          ;;
-        shadowsocks)
-          is_listen_tcp "$p" && ok "TCP listening ${p} (shadowsocks)" || bad "TCP NOT listening ${p} (shadowsocks)"
-          is_listen_udp "$p" && ok "UDP listening ${p} (shadowsocks)" || bad "UDP NOT listening ${p} (shadowsocks)"
-          ;;
-        *)
-          is_listen_tcp "$p" && ok "TCP listening ${p} (${t})" || bad "TCP NOT listening ${p} (${t})"
-          ;;
-      esac
-    done
-  else
-    bad "cannot parse inbounds from $CFG"
-  fi
-else
-  bad "missing $CFG"
-fi
-
-ip_now="$(curl -fsSL https://api.ipify.org 2>/dev/null || true)"
-[[ -n "$ip_now" ]] && ok "egress public ip: ${ip_now}" || bad "cannot fetch egress public ip"
-
-# WARP state (optional informational)
-trace="$(curl -fsSL https://www.cloudflare.com/cdn-cgi/trace/ 2>/dev/null || true)"
-warp_state="$(echo "$trace" | awk -F= '/^warp=/{print $2}_
+echo "==== 订阅已更新到 Gist（未打印订阅链接）===="
