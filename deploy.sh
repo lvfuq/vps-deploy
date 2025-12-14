@@ -6,20 +6,20 @@ BIN="/usr/local/bin/sing-box"
 CONF_JSON="${SB_DIR}/config.json"
 DATA_DIR="${SB_DIR}/data"
 CREDS_ENV="${SB_DIR}/creds.env"
+SUB_LOCAL_B64="${SB_DIR}/sub.txt"
+SUB_LOCAL_PLAIN="${SB_DIR}/sub_plain.txt"
 SUB_ENV="${SB_DIR}/sub_urls.env"
 SERVICE="sing-box.service"
 
 SS_METHOD="aes-256-gcm"
-REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"   # 你想改也行：export REALITY_SNI=xxx
+REALITY_SNI="${REALITY_SNI:-www.microsoft.com}"
 
 log(){ echo "[deploy] $*"; }
 warn(){ echo "[deploy][WARN] $*"; }
 die(){ echo "[deploy][ERROR] $*" >&2; exit 1; }
 has(){ command -v "$1" >/dev/null 2>&1; }
 
-require_root(){
-  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行（sudo -i 后再执行）"
-}
+require_root(){ [[ ${EUID:-$(id -u)} -eq 0 ]] || die "请用 root 运行（sudo -i）"; }
 
 apt_install(){
   export DEBIAN_FRONTEND=noninteractive
@@ -35,10 +35,7 @@ ensure_deps(){
   has openssl || die "openssl 未安装"
 }
 
-b64_nw(){
-  if base64 --help 2>/dev/null | grep -q -- "-w"; then base64 -w 0; else base64 | tr -d '\n'; fi
-}
-b64url_nopad(){ tr '+/' '-_' | tr -d '='; }
+b64_nw(){ if base64 --help 2>/dev/null | grep -q -- "-w"; then base64 -w 0; else base64 | tr -d '\n'; fi; }
 
 rand_port(){
   local p
@@ -113,24 +110,19 @@ EOF
   fi
 }
 
-rand_hex8(){
-  openssl rand -hex 8 | tr -d '\n'
-}
-
-gen_uuid(){
-  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi
-}
-
-gen_reality_keypair(){
-  "$BIN" generate reality-keypair
-}
+rand_hex8(){ openssl rand -hex 8 | tr -d '\n'; }
+gen_uuid(){ if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi; }
+gen_reality_keypair(){ "$BIN" generate reality-keypair; }
 
 save_creds(){
   cat >"$CREDS_ENV" <<EOF
 UUID=$UUID
-SS_PORT=$SS_PORT
-SS_PASSWORD=$(printf '%q' "$SS_PASSWORD")
-VLESS_PORT=$VLESS_PORT
+SS1_PORT=$SS1_PORT
+SS1_PASSWORD=$(printf '%q' "$SS1_PASSWORD")
+SS2_PORT=$SS2_PORT
+SS2_PASSWORD=$(printf '%q' "$SS2_PASSWORD")
+VLESS_VISION_PORT=$VLESS_VISION_PORT
+VLESS_PLAIN_PORT=$VLESS_PLAIN_PORT
 TROJAN_PORT=$TROJAN_PORT
 REALITY_PRIV=$(printf '%q' "$REALITY_PRIV")
 REALITY_PUB=$(printf '%q' "$REALITY_PUB")
@@ -150,10 +142,14 @@ write_config(){
   load_creds_if_any
 
   : "${UUID:=$(gen_uuid)}"
-  : "${SS_PORT:=$(rand_port)}"
-  : "${VLESS_PORT:=$(rand_port)}"
+  : "${SS1_PORT:=$(rand_port)}"
+  : "${SS2_PORT:=$(rand_port)}"
+  : "${VLESS_VISION_PORT:=$(rand_port)}"
+  : "${VLESS_PLAIN_PORT:=$(rand_port)}"
   : "${TROJAN_PORT:=$(rand_port)}"
-  : "${SS_PASSWORD:=$(openssl rand -base64 24 | tr -d '\n')}"
+
+  : "${SS1_PASSWORD:=$(openssl rand -base64 24 | tr -d '\n')}"
+  : "${SS2_PASSWORD:=$(openssl rand -base64 24 | tr -d '\n')}"
 
   if [[ -z "${REALITY_PRIV:-}" || -z "${REALITY_PUB:-}" ]]; then
     mapfile -t RKP < <(gen_reality_keypair)
@@ -167,56 +163,41 @@ write_config(){
   jq -n \
     --arg uuid "$UUID" \
     --arg ss_method "$SS_METHOD" \
-    --arg ss_pass "$SS_PASSWORD" \
+    --arg ss1_pass "$SS1_PASSWORD" \
+    --arg ss2_pass "$SS2_PASSWORD" \
     --arg sni "$REALITY_SNI" \
     --arg rpriv "$REALITY_PRIV" \
     --arg sid "$REALITY_SID" \
-    --argjson ss_port "$SS_PORT" \
-    --argjson vless_port "$VLESS_PORT" \
+    --argjson ss1_port "$SS1_PORT" \
+    --argjson ss2_port "$SS2_PORT" \
+    --argjson vless_vision_port "$VLESS_VISION_PORT" \
+    --argjson vless_plain_port "$VLESS_PLAIN_PORT" \
     --argjson trojan_port "$TROJAN_PORT" \
     '{
       log:{level:"info",timestamp:true},
       inbounds:[
+        {type:"shadowsocks", tag:"ss1", listen:"0.0.0.0", listen_port:$ss1_port, method:$ss_method, password:$ss1_pass},
+        {type:"shadowsocks", tag:"ss2", listen:"0.0.0.0", listen_port:$ss2_port, method:$ss_method, password:$ss2_pass},
+
         {
-          type:"shadowsocks",
-          tag:"ss-in",
-          listen:"0.0.0.0",
-          listen_port:$ss_port,
-          method:$ss_method,
-          password:$ss_pass
-        },
-        {
-          type:"vless",
-          tag:"vless-reality",
-          listen:"0.0.0.0",
-          listen_port:$vless_port,
+          type:"vless", tag:"vless-vision", listen:"0.0.0.0", listen_port:$vless_vision_port,
           users:[{uuid:$uuid, flow:"xtls-rprx-vision"}],
-          tls:{
-            enabled:true,
-            server_name:$sni,
-            reality:{
-              enabled:true,
-              handshake:{server:$sni, server_port:443},
-              private_key:$rpriv,
-              short_id:[$sid]
-            }
+          tls:{enabled:true, server_name:$sni,
+            reality:{enabled:true, handshake:{server:$sni, server_port:443}, private_key:$rpriv, short_id:[$sid]}
           }
         },
         {
-          type:"trojan",
-          tag:"trojan-reality",
-          listen:"0.0.0.0",
-          listen_port:$trojan_port,
+          type:"vless", tag:"vless", listen:"0.0.0.0", listen_port:$vless_plain_port,
+          users:[{uuid:$uuid}],
+          tls:{enabled:true, server_name:$sni,
+            reality:{enabled:true, handshake:{server:$sni, server_port:443}, private_key:$rpriv, short_id:[$sid]}
+          }
+        },
+        {
+          type:"trojan", tag:"trojan", listen:"0.0.0.0", listen_port:$trojan_port,
           users:[{password:$uuid}],
-          tls:{
-            enabled:true,
-            server_name:$sni,
-            reality:{
-              enabled:true,
-              handshake:{server:$sni, server_port:443},
-              private_key:$rpriv,
-              short_id:[$sid]
-            }
+          tls:{enabled:true, server_name:$sni,
+            reality:{enabled:true, handshake:{server:$sni, server_port:443}, private_key:$rpriv, short_id:[$sid]}
           }
         }
       ],
@@ -254,49 +235,47 @@ EOF
 
 open_firewall(){
   load_creds_if_any
-  local tcp_ports=("$SS_PORT" "$VLESS_PORT" "$TROJAN_PORT")
-
-  if has ufw && ufw status | grep -qi active; then
-    for p in "${tcp_ports[@]}"; do ufw allow "${p}/tcp" >/dev/null 2>&1 || true; done
-    ufw reload >/dev/null 2>&1 || true
-    log "已通过 ufw 放行 TCP 端口：${tcp_ports[*]}"
-    return 0
-  fi
-
-  if has firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
-    for p in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true; done
-    firewall-cmd --reload >/dev/null 2>&1 || true
-    log "已通过 firewalld 放行 TCP 端口：${tcp_ports[*]}"
-    return 0
-  fi
+  local tcp_ports=("$SS1_PORT" "$SS2_PORT" "$VLESS_VISION_PORT" "$VLESS_PLAIN_PORT" "$TROJAN_PORT")
+  local udp_ports=("$SS1_PORT" "$SS2_PORT")
 
   for p in "${tcp_ports[@]}"; do
     iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
   done
+  for p in "${udp_ports[@]}"; do
+    iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+  done
+
   if has netfilter-persistent; then netfilter-persistent save >/dev/null 2>&1 || true; fi
-  log "已通过 iptables 放行 TCP 端口：${tcp_ports[*]}"
-  warn "如果你用的是云厂商安全组（Vultr/Oracle 等），还要在控制台放行这些端口"
+
+  log "已放行 TCP 端口：${tcp_ports[*]}（SS 额外放行 UDP：${udp_ports[*]}）"
+  warn "如使用云厂商安全组（Vultr 面板），还需在控制台放行这些端口"
 }
 
 make_links(){
   load_creds_if_any
   local ip; ip="$(get_ip)"
 
-  # SS: ss://base64url(method:pass)@ip:port#ss
-  local userinfo ss_link vless_link trojan_link
-  userinfo="$(printf "%s:%s" "$SS_METHOD" "$SS_PASSWORD" | b64_nw | b64url_nopad)"
-  ss_link="ss://${userinfo}@${ip}:${SS_PORT}#ss"
+  local ss1_user ss2_user
+  ss1_user="$(printf "%s:%s" "$SS_METHOD" "$SS1_PASSWORD" | b64_nw)"
+  ss2_user="$(printf "%s:%s" "$SS_METHOD" "$SS2_PASSWORD" | b64_nw)"
 
-  vless_link="vless://${UUID}@${ip}:${VLESS_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality"
-  trojan_link="trojan://${UUID}@${ip}:${TROJAN_PORT}?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality"
+  echo "ss://${ss1_user}@${ip}:${SS1_PORT}#ss1"
+  echo "ss://${ss2_user}@${ip}:${SS2_PORT}#ss2"
+  echo "vless://${UUID}@${ip}:${VLESS_VISION_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality-vision"
+  echo "vless://${UUID}@${ip}:${VLESS_PLAIN_PORT}?encryption=none&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#vless-reality"
+  echo "trojan://${UUID}@${ip}:${TROJAN_PORT}?security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}&type=tcp#trojan-reality"
+}
 
-  echo "$ss_link"
-  echo "$vless_link"
-  echo "$trojan_link"
+write_local_subscription_files(){
+  local plain b64
+  plain="$(make_links)"$'\n'
+  printf "%s" "$plain" >"$SUB_LOCAL_PLAIN"
+  b64="$(printf "%s" "$plain" | b64_nw)"
+  printf "%s" "$b64" >"$SUB_LOCAL_B64"
+  log "已生成本地订阅文件：$SUB_LOCAL_B64（base64） / $SUB_LOCAL_PLAIN（明文）"
 }
 
 self_test_ss_loopback(){
-  # 只做 SS 闭环自测（最可靠）
   load_creds_if_any
   local test_cfg="/tmp/sb-test.json"
   local socks_port="10808"
@@ -306,7 +285,7 @@ self_test_ss_loopback(){
   "log":{"level":"error"},
   "inbounds":[{"type":"socks","listen":"127.0.0.1","listen_port":${socks_port}}],
   "outbounds":[
-    {"type":"shadowsocks","tag":"ss","server":"127.0.0.1","server_port":${SS_PORT},"method":"${SS_METHOD}","password":"${SS_PASSWORD}"},
+    {"type":"shadowsocks","tag":"ss","server":"127.0.0.1","server_port":${SS1_PORT},"method":"${SS_METHOD}","password":"${SS1_PASSWORD}"},
     {"type":"direct","tag":"direct"}
   ],
   "route":{"final":"ss"}
@@ -314,13 +293,12 @@ self_test_ss_loopback(){
 EOF
 
   "$BIN" check -c "$test_cfg" >/dev/null 2>&1 || { warn "自测配置检查失败"; return 0; }
-
   "$BIN" run -c "$test_cfg" >/tmp/sb-test.log 2>&1 &
   local pid=$!
   sleep 0.8
 
   if curl -fsS --socks5-hostname "127.0.0.1:${socks_port}" https://www.cloudflare.com/cdn-cgi/trace >/dev/null 2>&1; then
-    log "自测通过：SS 工作正常（本机回环 OK）"
+    log "自测通过：SS1 工作正常（本机回环 OK）"
   else
     warn "自测失败：请看 /tmp/sb-test.log 以及 systemctl status ${SERVICE}"
   fi
@@ -332,31 +310,30 @@ EOF
 update_gist_subscription_if_needed(){
   [[ -n "${GIST_ID:-}" && -n "${GH_TOKEN:-}" ]] || return 0
 
-  local links plain sub_b64 payload resp code raw_b64 raw_plain
-  links="$(make_links)"
-  plain="${links}"$'\n'
-  sub_b64="$(printf "%s" "$plain" | b64_nw)"
+  write_local_subscription_files
 
-  payload="$(jq -n \
-    --arg sub_b64 "$sub_b64" \
-    --arg plain "$plain" \
-    '{
-      files:{
-        "sub.txt":{content:$sub_b64},
-        "sub_plain.txt":{content:$plain}
-      }
-    }')"
+  local sub_b64 plain payload resp code raw_b64 raw_plain
+  sub_b64="$(cat "$SUB_LOCAL_B64")"
+  plain="$(cat "$SUB_LOCAL_PLAIN")"
+
+  payload="$(jq -n --arg sub_b64 "$sub_b64" --arg plain "$plain" '{
+    files:{
+      "sub.txt":{content:$sub_b64},
+      "sub_plain.txt":{content:$plain}
+    }
+  }')"
 
   resp="$(mktemp)"
+  # 关键修复：Authorization 头不要带多余引号
   code="$(curl -sS -o "$resp" -w "%{http_code}" \
     -X PATCH \
-    -H "Authorization: Bearer '"$GH_TOKEN"'" \
+    -H "Authorization: Bearer ${GH_TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/gists/${GIST_ID}" \
     -d "$payload" || true)"
 
   if [[ "$code" != "200" ]]; then
-    warn "Gist 更新失败（HTTP $code）。通常是 token 没有 gist 权限 / GIST_ID 写错 / token 失效"
+    warn "Gist 更新失败（HTTP $code）。通常是 token 没有 gist 写权限 / GIST_ID 不对 / token 失效"
     rm -f "$resp"
     return 0
   fi
@@ -365,13 +342,14 @@ update_gist_subscription_if_needed(){
   raw_plain="$(jq -r '.files["sub_plain.txt"].raw_url' <"$resp")"
   rm -f "$resp"
 
-  mkdir -p "$SB_DIR"
   cat >"$SUB_ENV" <<EOF
 SUB_B64_URL=$raw_b64
 SUB_PLAIN_URL=$raw_plain
 EOF
 
-  log "订阅已更新到你的 Gist（链接已写入 $SUB_ENV，不在终端打印）"
+  log "Gist 订阅更新成功："
+  echo "  BASE64订阅：$raw_b64"
+  echo "  明文订阅：  $raw_plain"
 }
 
 main(){
@@ -384,10 +362,11 @@ main(){
   open_firewall
 
   echo
-  echo "==== 节点链接（我帮你选的“好用三件套”）===="
+  echo "==== 节点链接（5 个：2SS + 2VLESS + 1Trojan）===="
   make_links
   echo
 
+  write_local_subscription_files
   self_test_ss_loopback
   update_gist_subscription_if_needed || true
 
